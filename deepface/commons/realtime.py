@@ -5,8 +5,10 @@ import pandas as pd
 import cv2
 import time
 import re
+import threading
 
 import os
+
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
 
 from deepface import DeepFace
@@ -14,452 +16,368 @@ from deepface.extendedmodels import Age
 from deepface.commons import functions, realtime, distance as dst
 from deepface.detectors import FaceDetector
 
-def analysis(db_path, model_name = 'VGG-Face', detector_backend = 'opencv', distance_metric = 'cosine', enable_face_analysis = True, source = 0, time_threshold = 5, frame_threshold = 5):
+employee_lock = threading.Lock()
+employee_name_recon = None
+unknown_employee_name = "UNKNOWN"
 
-	#------------------------
+def analyze_image(image, input_shape, data_frame, detected_faces_final, enable_face_analysis, face_model, face_model_threshold, emotion_model, age_model, gender_model):
+    global employee_name_recon
+    global unknown_employee_name
 
-	face_detector = FaceDetector.build_model(detector_backend)
-	print("Detector backend is ", detector_backend)
+    time.sleep(1)
+    for detected_face in detected_faces_final:
+        x = detected_face[0]
+        y = detected_face[1]
+        w = detected_face[2]
+        h = detected_face[3]
 
-	#------------------------
+        # -------------------------------
 
-	input_shape = (224, 224); input_shape_x = input_shape[0]; input_shape_y = input_shape[1]
+        # apply deep learning for custom_face
 
-	text_color = (255,255,255)
+        custom_face = image[y:y + h, x:x + w]
 
-	employees = []
-	#check passed db folder exists
-	if os.path.isdir(db_path) == True:
-		for r, d, f in os.walk(db_path): # r=root, d=directories, f = files
-			for file in f:
-				if ('.jpg' in file):
-					#exact_path = os.path.join(r, file)
-					exact_path = r + "/" + file
-					#print(exact_path)
-					employees.append(exact_path)
+        # -------------------------------
+        # facial attribute analysis
 
-	if len(employees) == 0:
-		print("WARNING: There is no image in this path ( ", db_path,") . Face recognition will not be performed.")
+        if enable_face_analysis:
 
-	#------------------------
+            gray_img = functions.preprocess_face(img=custom_face, target_size=(48, 48), grayscale=True,
+                                                 enforce_detection=False, detector_backend='opencv')
+            emotion_labels = ['Angry', 'Disgust', 'Fear', 'Happy', 'Sad', 'Surprise', 'Neutral']
+            emotion_predictions = emotion_model.predict(gray_img)[0, :]
+            sum_of_predictions = emotion_predictions.sum()
 
-	if len(employees) > 0:
+            mood_items = []
+            for i in range(0, len(emotion_labels)):
+                mood_item = []
+                emotion_label = emotion_labels[i]
+                emotion_prediction = 100 * emotion_predictions[i] / sum_of_predictions
+                mood_item.append(emotion_label)
+                mood_item.append(emotion_prediction)
+                mood_items.append(mood_item)
 
-		model = DeepFace.build_model(model_name)
-		print(model_name," is built")
+            emotion_df = pd.DataFrame(mood_items, columns=["emotion", "score"])
+            emotion_df = emotion_df.sort_values(by=["score"], ascending=False).reset_index(drop=True)
 
-		#------------------------
+            # background of mood box
 
-		input_shape = functions.find_input_shape(model)
-		input_shape_x = input_shape[0]; input_shape_y = input_shape[1]
+            for index, instance in emotion_df.iterrows():
+                emotion_label = "%s " % (instance['emotion'])
+                emotion_score = instance['score'] / 100
 
-		#tuned thresholds for model and metric pair
-		threshold = dst.findThreshold(model_name, distance_metric)
+            # -------------------------------
 
-	#------------------------
-	#facial attribute analysis models
+            face_224 = functions.preprocess_face(img=custom_face, target_size=(224, 224),
+                                                 grayscale=False, enforce_detection=False,
+                                                 detector_backend='opencv')
 
-	if enable_face_analysis == True:
+            age_predictions = age_model.predict(face_224)[0, :]
+            apparent_age = Age.findApparentAge(age_predictions)
 
-		tic = time.time()
+            # -------------------------------
 
-		emotion_model = DeepFace.build_model('Emotion')
-		print("Emotion model loaded")
+            gender_prediction = gender_model.predict(face_224)[0, :]
 
-		age_model = DeepFace.build_model('Age')
-		print("Age model loaded")
+            if np.argmax(gender_prediction) == 0:
+                gender = "W"
+            elif np.argmax(gender_prediction) == 1:
+                gender = "M"
 
-		gender_model = DeepFace.build_model('Gender')
-		print("Gender model loaded")
+            # print(str(int(apparent_age))," years old ", dominant_emotion, " ", gender)
 
-		toc = time.time()
+            analysis_report = str(int(apparent_age)) + " " + gender
 
-		print("Facial attibute analysis models loaded in ",toc-tic," seconds")
+            print(f"employee analysis: emotion: {emotion_label} ({emotion_score}), {analysis_report}")
 
-	#------------------------
+        # -------------------------------
+        # face recognition
 
-	#find embeddings for employee list
+        custom_face = functions.preprocess_face(img=custom_face,
+                                                target_size=(input_shape[1], input_shape[0]),
+                                                enforce_detection=False, detector_backend='opencv')
 
-	tic = time.time()
+        # check preprocess_face function handled
+        if custom_face.shape[1:3] == input_shape:
+            if data_frame.shape[0] > 0:  # if there are images to verify, apply face recognition
+                img1_representation = face_model.predict(custom_face)[0, :]
 
-	#-----------------------
+                # print(freezed_frame," - ",img1_representation[0:5])
 
-	pbar = tqdm(range(0, len(employees)), desc='Finding embeddings')
+                def findDistance(row):
+                    distance_metric = row['distance_metric']
+                    img2_representation = row['embedding']
 
-	#TODO: why don't you store those embeddings in a pickle file similar to find function?
+                    distance = 1000  # initialize very large value
+                    if distance_metric == 'cosine':
+                        distance = dst.findCosineDistance(img1_representation, img2_representation)
+                    elif distance_metric == 'euclidean':
+                        distance = dst.findEuclideanDistance(img1_representation, img2_representation)
+                    elif distance_metric == 'euclidean_l2':
+                        distance = dst.findEuclideanDistance(dst.l2_normalize(img1_representation),
+                                                             dst.l2_normalize(img2_representation))
 
-	embeddings = []
-	#for employee in employees:
-	for index in pbar:
-		employee = employees[index]
-		pbar.set_description("Finding embedding for %s" % (employee.split("/")[-1]))
-		embedding = []
+                    return distance
 
-		#preprocess_face returns single face. this is expected for source images in db.
-		img = functions.preprocess_face(img = employee, target_size = (input_shape_y, input_shape_x), enforce_detection = False, detector_backend = detector_backend)
-		img_representation = model.predict(img)[0,:]
+                data_frame['distance'] = data_frame.apply(findDistance, axis=1)
+                data_frame = data_frame.sort_values(by=["distance"])
 
-		embedding.append(employee)
-		embedding.append(img_representation)
-		embeddings.append(embedding)
+                candidate = data_frame.iloc[0]
+                employee_name = candidate['employee']
+                best_distance = candidate['distance']
 
-	df = pd.DataFrame(embeddings, columns = ['employee', 'embedding'])
-	df['distance_metric'] = distance_metric
+                # print(candidate[['employee', 'distance']].values)
 
-	toc = time.time()
+                # if True:
+                if best_distance <= face_model_threshold:
+                    # print(employee_name)
+                    display_img = cv2.imread(employee_name)
 
-	print("Embeddings found for given data set in ", toc-tic," seconds")
+                    label = employee_name.split("/")[-2]
+                    employee_lock.acquire()
+                    employee_name_recon = label
+                    employee_lock.release()
+                    print(f"employee recognized: {label}")
+                    # publish something here
+                else:
+                    employee_lock.acquire()
+                    employee_name_recon = unknown_employee_name
+                    employee_lock.release()
 
-	#-----------------------
 
-	pivot_img_size = 112 #face recognition result image
+def analysis(db_path, model_name='VGG-Face', detector_backend='opencv', distance_metric='cosine',
+             enable_face_analysis=True, source=0, time_threshold=5, frame_threshold=5):
+    # ------------------------
 
-	#-----------------------
+    face_detector = FaceDetector.build_model(detector_backend)
+    print("Detector backend is ", detector_backend)
 
-	freeze = False
-	face_detected = False
-	face_included_frames = 0 #freeze screen if face detected sequantially 5 frames
-	freezed_frame = 0
-	tic = time.time()
+    # ------------------------
 
-	cap = cv2.VideoCapture(source) #webcam
+    input_shape = (224, 224)
+    input_shape_x = input_shape[0]
+    input_shape_y = input_shape[1]
 
-	while(True):
-		ret, img = cap.read()
+    text_color = (255, 255, 255)
 
-		if img is None:
-			break
+    employees = []
+    # check passed db folder exists
+    if os.path.isdir(db_path) == True:
+        for r, d, f in os.walk(db_path):  # r=root, d=directories, f = files
+            for file in f:
+                if ('.jpg' in file):
+                    # exact_path = os.path.join(r, file)
+                    exact_path = r + "/" + file
+                    # print(exact_path)
+                    employees.append(exact_path)
 
-		#cv2.namedWindow('img', cv2.WINDOW_FREERATIO)
-		#cv2.setWindowProperty('img', cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
+    if len(employees) == 0:
+        print("WARNING: There is no image in this path ( ", db_path, ") . Face recognition will not be performed.")
 
-		raw_img = img.copy()
-		resolution = img.shape; resolution_x = img.shape[1]; resolution_y = img.shape[0]
+    # ------------------------
 
-		if freeze == False:
-			#faces = face_cascade.detectMultiScale(img, 1.3, 5)
+    if len(employees) > 0:
+        model = DeepFace.build_model(model_name)
+        print(model_name, " is built")
 
-			#faces stores list of detected_face and region pair
-			faces = FaceDetector.detect_faces(face_detector, detector_backend, img, align = False)
+        # ------------------------
 
-			if len(faces) == 0:
-				face_included_frames = 0
-		else:
-			faces = []
+        input_shape = functions.find_input_shape(model)
+        input_shape_x = input_shape[0];
+        input_shape_y = input_shape[1]
 
-		detected_faces = []
-		face_index = 0
-		for face, (x, y, w, h) in faces:
-			if w > 130: #discard small detected faces
+        # tuned thresholds for model and metric pair
+        threshold = dst.findThreshold(model_name, distance_metric)
 
-				face_detected = True
-				if face_index == 0:
-					face_included_frames = face_included_frames + 1 #increase frame for a single face
+    # ------------------------
+    # facial attribute analysis models
 
-				cv2.rectangle(img, (x,y), (x+w,y+h), (67,67,67), 1) #draw rectangle to main image
+    if enable_face_analysis == True:
+        tic = time.time()
 
-				cv2.putText(img, str(frame_threshold - face_included_frames), (int(x+w/4),int(y+h/1.5)), cv2.FONT_HERSHEY_SIMPLEX, 4, (255, 255, 255), 2)
+        emotion_model = DeepFace.build_model('Emotion')
+        print("Emotion model loaded")
 
-				detected_face = img[int(y):int(y+h), int(x):int(x+w)] #crop detected face
+        age_model = DeepFace.build_model('Age')
+        print("Age model loaded")
 
-				#-------------------------------------
+        gender_model = DeepFace.build_model('Gender')
+        print("Gender model loaded")
 
-				detected_faces.append((x,y,w,h))
-				face_index = face_index + 1
+        toc = time.time()
 
-				#-------------------------------------
+        print("Facial attibute analysis models loaded in ", toc - tic, " seconds")
 
-		if face_detected == True and face_included_frames == frame_threshold and freeze == False:
-			freeze = True
-			#base_img = img.copy()
-			base_img = raw_img.copy()
-			detected_faces_final = detected_faces.copy()
-			tic = time.time()
+    # ------------------------
 
-		if freeze == True:
+    # find embeddings for employee list
 
-			toc = time.time()
-			if (toc - tic) < time_threshold:
+    tic = time.time()
 
-				if freezed_frame == 0:
-					freeze_img = base_img.copy()
-					#freeze_img = np.zeros(resolution, np.uint8) #here, np.uint8 handles showing white area issue
+    # -----------------------
 
-					for detected_face in detected_faces_final:
-						x = detected_face[0]; y = detected_face[1]
-						w = detected_face[2]; h = detected_face[3]
+    pbar = tqdm(range(0, len(employees)), desc='Finding embeddings')
 
-						cv2.rectangle(freeze_img, (x,y), (x+w,y+h), (67,67,67), 1) #draw rectangle to main image
+    # TODO: why don't you store those embeddings in a pickle file similar to find function?
 
-						#-------------------------------
+    embeddings = []
+    # for employee in employees:
+    for index in pbar:
+        employee = employees[index]
+        pbar.set_description("Finding embedding for %s" % (employee.split("/")[-1]))
+        embedding = []
 
-						#apply deep learning for custom_face
+        # preprocess_face returns single face. this is expected for source images in db.
+        img = functions.preprocess_face(img=employee, target_size=(input_shape_y, input_shape_x),
+                                        enforce_detection=False, detector_backend=detector_backend)
+        img_representation = model.predict(img)[0, :]
 
-						custom_face = base_img[y:y+h, x:x+w]
+        embedding.append(employee)
+        embedding.append(img_representation)
+        embeddings.append(embedding)
 
-						#-------------------------------
-						#facial attribute analysis
+    df = pd.DataFrame(embeddings, columns=['employee', 'embedding'])
+    df['distance_metric'] = distance_metric
 
-						if enable_face_analysis == True:
+    toc = time.time()
 
-							gray_img = functions.preprocess_face(img = custom_face, target_size = (48, 48), grayscale = True, enforce_detection = False, detector_backend = 'opencv')
-							emotion_labels = ['Angry', 'Disgust', 'Fear', 'Happy', 'Sad', 'Surprise', 'Neutral']
-							emotion_predictions = emotion_model.predict(gray_img)[0,:]
-							sum_of_predictions = emotion_predictions.sum()
+    print("Embeddings found for given data set in ", toc - tic, " seconds")
 
-							mood_items = []
-							for i in range(0, len(emotion_labels)):
-								mood_item = []
-								emotion_label = emotion_labels[i]
-								emotion_prediction = 100 * emotion_predictions[i] / sum_of_predictions
-								mood_item.append(emotion_label)
-								mood_item.append(emotion_prediction)
-								mood_items.append(mood_item)
+    # -----------------------
 
-							emotion_df = pd.DataFrame(mood_items, columns = ["emotion", "score"])
-							emotion_df = emotion_df.sort_values(by = ["score"], ascending=False).reset_index(drop=True)
+    pivot_img_size = 112  # face recognition result image
 
-							#background of mood box
+    # -----------------------
 
-							#transparency
-							overlay = freeze_img.copy()
-							opacity = 0.4
+    freeze = False
+    face_detected = False
+    face_included_frames = 0  # freeze screen if face detected sequantially 5 frames
+    freezed_frame = 0
+    tic = time.time()
 
-							if x+w+pivot_img_size < resolution_x:
-								#right
-								cv2.rectangle(freeze_img
-									#, (x+w,y+20)
-									, (x+w,y)
-									, (x+w+pivot_img_size, y+h)
-									, (64,64,64),cv2.FILLED)
+    cap = cv2.VideoCapture(source)  # webcam
 
-								cv2.addWeighted(overlay, opacity, freeze_img, 1 - opacity, 0, freeze_img)
+    while (True):
+        ret, img = cap.read()
 
-							elif x-pivot_img_size > 0:
-								#left
-								cv2.rectangle(freeze_img
-									#, (x-pivot_img_size,y+20)
-									, (x-pivot_img_size,y)
-									, (x, y+h)
-									, (64,64,64),cv2.FILLED)
+        if img is None:
+            break
 
-								cv2.addWeighted(overlay, opacity, freeze_img, 1 - opacity, 0, freeze_img)
+        # cv2.namedWindow('img', cv2.WINDOW_FREERATIO)
+        # cv2.setWindowProperty('img', cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
 
-							for index, instance in emotion_df.iterrows():
-								emotion_label = "%s " % (instance['emotion'])
-								emotion_score = instance['score']/100
+        raw_img = img.copy()
+        resolution = img.shape;
+        resolution_x = img.shape[1];
+        resolution_y = img.shape[0]
 
-								bar_x = 35 #this is the size if an emotion is 100%
-								bar_x = int(bar_x * emotion_score)
+        top_offset = 50
+        ellipse_y = int((resolution_y - top_offset) * 0.45)
+        ellipse_x = int(ellipse_y * 0.85)
+        ellipse_center = (int(resolution_x / 2), int((resolution_y + top_offset) / 2))
 
-								if x+w+pivot_img_size < resolution_x:
+        if not freeze:
+            # faces = face_cascade.detectMultiScale(img, 1.3, 5)
 
-									text_location_y = y + 20 + (index+1) * 20
-									text_location_x = x+w
+            # faces stores list of detected_face and region pair
+            faces = FaceDetector.detect_faces(face_detector, detector_backend, img, align=False)
 
-									if text_location_y < y + h:
-										cv2.putText(freeze_img, emotion_label, (text_location_x, text_location_y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+            if len(faces) == 0:
+                face_included_frames = 0
+        else:
+            faces = []
 
-										cv2.rectangle(freeze_img
-											, (x+w+70, y + 13 + (index+1) * 20)
-											, (x+w+70+bar_x, y + 13 + (index+1) * 20 + 5)
-											, (255,255,255), cv2.FILLED)
+        detected_faces = []
+        face_index = 0
+        center_offset = 40
+        for face, (x, y, w, h) in faces:
+            if ellipse_x * 1.5 < w < ellipse_x * 2 and \
+                    ellipse_center[0] - center_offset < x + w / 2 < ellipse_center[0] + center_offset and \
+                    ellipse_center[1] - center_offset < y + h / 2 < ellipse_center[
+                1] + center_offset:  # discard small detected faces
 
-								elif x-pivot_img_size > 0:
+                face_detected = True
+                if face_index == 0:
+                    face_included_frames = face_included_frames + 1  # increase frame for a single face
 
-									text_location_y = y + 20 + (index+1) * 20
-									text_location_x = x-pivot_img_size
+                #cv2.rectangle(img, (x, y), (x + w, y + h), (67, 67, 67), 1)  # draw rectangle to main image
 
-									if text_location_y <= y+h:
-										cv2.putText(freeze_img, emotion_label, (text_location_x, text_location_y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+                #cv2.putText(img, str(frame_threshold - face_included_frames), (int(x + w / 4), int(y + h / 1.5)),
+                #            cv2.FONT_HERSHEY_SIMPLEX, 4, (255, 255, 255), 2)
 
-										cv2.rectangle(freeze_img
-											, (x-pivot_img_size+70, y + 13 + (index+1) * 20)
-											, (x-pivot_img_size+70+bar_x, y + 13 + (index+1) * 20 + 5)
-											, (255,255,255), cv2.FILLED)
+                detected_face = img[int(y):int(y + h), int(x):int(x + w)]  # crop detected face
 
-							#-------------------------------
+                # -------------------------------------
 
-							face_224 = functions.preprocess_face(img = custom_face, target_size = (224, 224), grayscale = False, enforce_detection = False, detector_backend = 'opencv')
+                detected_faces.append((x, y, w, h))
+                face_index = face_index + 1
 
-							age_predictions = age_model.predict(face_224)[0,:]
-							apparent_age = Age.findApparentAge(age_predictions)
+            # -------------------------------------
 
-							#-------------------------------
+        if face_detected and face_included_frames >= frame_threshold and not freeze:
+            freeze = True
+            base_img = raw_img.copy()
+            detected_faces_final = detected_faces.copy()
 
-							gender_prediction = gender_model.predict(face_224)[0,:]
+            print("starting thread")
+            t = threading.Thread(target=analyze_image, args=(base_img, input_shape, df, detected_faces_final, enable_face_analysis, model, threshold, emotion_model, age_model, gender_model,))
+            t.start()
 
-							if np.argmax(gender_prediction) == 0:
-								gender = "W"
-							elif np.argmax(gender_prediction) == 1:
-								gender = "M"
+            print("continuing execution")
+            tic = time.time()
 
-							#print(str(int(apparent_age))," years old ", dominant_emotion, " ", gender)
+        if freeze:
 
-							analysis_report = str(int(apparent_age))+" "+gender
+            toc = time.time()
+            if (toc - tic) < time_threshold:
 
-							#-------------------------------
+                time_left = int(time_threshold - (toc - tic) + 1)
 
-							info_box_color = (46,200,255)
+                #cv2.rectangle(freeze_img, (10, 10), (90, 50), (67, 67, 67), -10)
+                #cv2.putText(freeze_img, str(time_left), (40, 40), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 1)
+                display_name = None
+                employee_lock.acquire()
+                display_name = employee_name_recon
+                employee_lock.release()
 
-							#top
-							if y - pivot_img_size + int(pivot_img_size/5) > 0:
+                if display_name and display_name != unknown_employee_name:
+                    message = f"Welcome {display_name}"
+                    cv2.putText(img, message, (40, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.75,
+                                (50, 50, 50), 2)
+                    cv2.ellipse(img=img, center=ellipse_center,
+                                axes=(ellipse_x, ellipse_y), angle=0, startAngle=0, endAngle=360,
+                                color=(0, 128, 0), thickness=2)
+                elif display_name and display_name == unknown_employee_name:
+                    cv2.putText(img, "Intruder!!", (40, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.75,
+                                (0, 9, 200), 2)
+                    cv2.ellipse(img=img, center=ellipse_center,
+                                axes=(ellipse_x, ellipse_y), angle=0, startAngle=0, endAngle=360,
+                                color=(0, 0, 200), thickness=2)
+                else:
+                    cv2.ellipse(img=img, center=ellipse_center,
+                                axes=(ellipse_x, ellipse_y), angle=0, startAngle=0, endAngle=360,
+                                color=(0, 128, 0), thickness=2)
 
-								triangle_coordinates = np.array( [
-									(x+int(w/2), y)
-									, (x+int(w/2)-int(w/10), y-int(pivot_img_size/3))
-									, (x+int(w/2)+int(w/10), y-int(pivot_img_size/3))
-								] )
 
-								cv2.drawContours(freeze_img, [triangle_coordinates], 0, info_box_color, -1)
+                freezed_frame = freezed_frame + 1
+            else:
+                face_detected = False
+                face_included_frames = 0
+                freeze = False
+                freezed_frame = 0
 
-								cv2.rectangle(freeze_img, (x+int(w/5), y-pivot_img_size+int(pivot_img_size/5)), (x+w-int(w/5), y-int(pivot_img_size/3)), info_box_color, cv2.FILLED)
+        else:
+            cv2.putText(img, "Place your face inside the circle", (40, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.75,
+                        (50, 50, 50), 2)
+            cv2.ellipse(img=img, center=ellipse_center,
+                        axes=(ellipse_x, ellipse_y), angle=0, startAngle=0, endAngle=360,
+                        color=(128, 128, 128), thickness=2)
 
-								cv2.putText(freeze_img, analysis_report, (x+int(w/3.5), y - int(pivot_img_size/2.1)), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 111, 255), 2)
+        cv2.imshow('img', img)
 
-							#bottom
-							elif y + h + pivot_img_size - int(pivot_img_size/5) < resolution_y:
+        if cv2.waitKey(1) & 0xFF == ord('q'):  # press q to quit
+            break
 
-								triangle_coordinates = np.array( [
-									(x+int(w/2), y+h)
-									, (x+int(w/2)-int(w/10), y+h+int(pivot_img_size/3))
-									, (x+int(w/2)+int(w/10), y+h+int(pivot_img_size/3))
-								] )
-
-								cv2.drawContours(freeze_img, [triangle_coordinates], 0, info_box_color, -1)
-
-								cv2.rectangle(freeze_img, (x+int(w/5), y + h + int(pivot_img_size/3)), (x+w-int(w/5), y+h+pivot_img_size-int(pivot_img_size/5)), info_box_color, cv2.FILLED)
-
-								cv2.putText(freeze_img, analysis_report, (x+int(w/3.5), y + h + int(pivot_img_size/1.5)), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 111, 255), 2)
-
-						#-------------------------------
-						#face recognition
-
-						custom_face = functions.preprocess_face(img = custom_face, target_size = (input_shape_y, input_shape_x), enforce_detection = False, detector_backend = 'opencv')
-
-						#check preprocess_face function handled
-						if custom_face.shape[1:3] == input_shape:
-							if df.shape[0] > 0: #if there are images to verify, apply face recognition
-								img1_representation = model.predict(custom_face)[0,:]
-
-								#print(freezed_frame," - ",img1_representation[0:5])
-
-								def findDistance(row):
-									distance_metric = row['distance_metric']
-									img2_representation = row['embedding']
-
-									distance = 1000 #initialize very large value
-									if distance_metric == 'cosine':
-										distance = dst.findCosineDistance(img1_representation, img2_representation)
-									elif distance_metric == 'euclidean':
-										distance = dst.findEuclideanDistance(img1_representation, img2_representation)
-									elif distance_metric == 'euclidean_l2':
-										distance = dst.findEuclideanDistance(dst.l2_normalize(img1_representation), dst.l2_normalize(img2_representation))
-
-									return distance
-
-								df['distance'] = df.apply(findDistance, axis = 1)
-								df = df.sort_values(by = ["distance"])
-
-								candidate = df.iloc[0]
-								employee_name = candidate['employee']
-								best_distance = candidate['distance']
-
-								#print(candidate[['employee', 'distance']].values)
-
-								#if True:
-								if best_distance <= threshold:
-									#print(employee_name)
-									display_img = cv2.imread(employee_name)
-
-									display_img = cv2.resize(display_img, (pivot_img_size, pivot_img_size))
-
-									label = employee_name.split("/")[-1].replace(".jpg", "")
-									label = re.sub('[0-9]', '', label)
-
-									try:
-										if y - pivot_img_size > 0 and x + w + pivot_img_size < resolution_x:
-											#top right
-											freeze_img[y - pivot_img_size:y, x+w:x+w+pivot_img_size] = display_img
-
-											overlay = freeze_img.copy(); opacity = 0.4
-											cv2.rectangle(freeze_img,(x+w,y),(x+w+pivot_img_size, y+20),(46,200,255),cv2.FILLED)
-											cv2.addWeighted(overlay, opacity, freeze_img, 1 - opacity, 0, freeze_img)
-
-											cv2.putText(freeze_img, label, (x+w, y+10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, text_color, 1)
-
-											#connect face and text
-											cv2.line(freeze_img,(x+int(w/2), y), (x+3*int(w/4), y-int(pivot_img_size/2)),(67,67,67),1)
-											cv2.line(freeze_img, (x+3*int(w/4), y-int(pivot_img_size/2)), (x+w, y - int(pivot_img_size/2)), (67,67,67),1)
-
-										elif y + h + pivot_img_size < resolution_y and x - pivot_img_size > 0:
-											#bottom left
-											freeze_img[y+h:y+h+pivot_img_size, x-pivot_img_size:x] = display_img
-
-											overlay = freeze_img.copy(); opacity = 0.4
-											cv2.rectangle(freeze_img,(x-pivot_img_size,y+h-20),(x, y+h),(46,200,255),cv2.FILLED)
-											cv2.addWeighted(overlay, opacity, freeze_img, 1 - opacity, 0, freeze_img)
-
-											cv2.putText(freeze_img, label, (x - pivot_img_size, y+h-10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, text_color, 1)
-
-											#connect face and text
-											cv2.line(freeze_img,(x+int(w/2), y+h), (x+int(w/2)-int(w/4), y+h+int(pivot_img_size/2)),(67,67,67),1)
-											cv2.line(freeze_img, (x+int(w/2)-int(w/4), y+h+int(pivot_img_size/2)), (x, y+h+int(pivot_img_size/2)), (67,67,67),1)
-
-										elif y - pivot_img_size > 0 and x - pivot_img_size > 0:
-											#top left
-											freeze_img[y-pivot_img_size:y, x-pivot_img_size:x] = display_img
-
-											overlay = freeze_img.copy(); opacity = 0.4
-											cv2.rectangle(freeze_img,(x- pivot_img_size,y),(x, y+20),(46,200,255),cv2.FILLED)
-											cv2.addWeighted(overlay, opacity, freeze_img, 1 - opacity, 0, freeze_img)
-
-											cv2.putText(freeze_img, label, (x - pivot_img_size, y+10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, text_color, 1)
-
-											#connect face and text
-											cv2.line(freeze_img,(x+int(w/2), y), (x+int(w/2)-int(w/4), y-int(pivot_img_size/2)),(67,67,67),1)
-											cv2.line(freeze_img, (x+int(w/2)-int(w/4), y-int(pivot_img_size/2)), (x, y - int(pivot_img_size/2)), (67,67,67),1)
-
-										elif x+w+pivot_img_size < resolution_x and y + h + pivot_img_size < resolution_y:
-											#bottom righ
-											freeze_img[y+h:y+h+pivot_img_size, x+w:x+w+pivot_img_size] = display_img
-
-											overlay = freeze_img.copy(); opacity = 0.4
-											cv2.rectangle(freeze_img,(x+w,y+h-20),(x+w+pivot_img_size, y+h),(46,200,255),cv2.FILLED)
-											cv2.addWeighted(overlay, opacity, freeze_img, 1 - opacity, 0, freeze_img)
-
-											cv2.putText(freeze_img, label, (x+w, y+h-10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, text_color, 1)
-
-											#connect face and text
-											cv2.line(freeze_img,(x+int(w/2), y+h), (x+int(w/2)+int(w/4), y+h+int(pivot_img_size/2)),(67,67,67),1)
-											cv2.line(freeze_img, (x+int(w/2)+int(w/4), y+h+int(pivot_img_size/2)), (x+w, y+h+int(pivot_img_size/2)), (67,67,67),1)
-									except Exception as err:
-										print(str(err))
-
-						tic = time.time() #in this way, freezed image can show 5 seconds
-
-						#-------------------------------
-
-				time_left = int(time_threshold - (toc - tic) + 1)
-
-				cv2.rectangle(freeze_img, (10, 10), (90, 50), (67,67,67), -10)
-				cv2.putText(freeze_img, str(time_left), (40, 40), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 1)
-
-				cv2.imshow('img', freeze_img)
-
-				freezed_frame = freezed_frame + 1
-			else:
-				face_detected = False
-				face_included_frames = 0
-				freeze = False
-				freezed_frame = 0
-
-		else:
-			cv2.imshow('img',img)
-
-		if cv2.waitKey(1) & 0xFF == ord('q'): #press q to quit
-			break
-
-	#kill open cv things
-	cap.release()
-	cv2.destroyAllWindows()
+    # kill open cv things
+    cap.release()
+    cv2.destroyAllWindows()
