@@ -20,7 +20,7 @@ employee_lock = threading.Lock()
 employee_name_recon = None
 unknown_employee_name = "UNKNOWN"
 
-def analyze_image(image, input_shape, data_frame, detected_faces_final, enable_face_analysis, face_model, face_model_threshold, emotion_model, age_model, gender_model):
+def analyze_image(image, input_shape, data_frame, detected_faces_final, enable_face_analysis, face_model, face_model_threshold, emotion_model, age_model, gender_model, callback):
     global employee_name_recon
     global unknown_employee_name
 
@@ -62,9 +62,14 @@ def analyze_image(image, input_shape, data_frame, detected_faces_final, enable_f
 
             # background of mood box
 
+            emotion_label = ""
+            highest_emotion_score = 0.0
+
             for index, instance in emotion_df.iterrows():
-                emotion_label = "%s " % (instance['emotion'])
                 emotion_score = instance['score'] / 100
+                if emotion_score > highest_emotion_score:
+                    emotion_label = "%s " % (instance['emotion'])
+                    highest_emotion_score = emotion_score
 
             # -------------------------------
 
@@ -88,7 +93,7 @@ def analyze_image(image, input_shape, data_frame, detected_faces_final, enable_f
 
             analysis_report = str(int(apparent_age)) + " " + gender
 
-            print(f"employee analysis: emotion: {emotion_label} ({emotion_score}), {analysis_report}")
+            print(f"employee analysis: emotion: {emotion_label} ({highest_emotion_score}), {analysis_report}")
 
         # -------------------------------
         # face recognition
@@ -146,7 +151,7 @@ def analyze_image(image, input_shape, data_frame, detected_faces_final, enable_f
 
 
 def analysis(db_path, model_name='VGG-Face', detector_backend='opencv', distance_metric='cosine',
-             enable_face_analysis=True, source=0, time_threshold=5, frame_threshold=5):
+             enable_face_analysis=True, source=0, time_threshold=5, frame_threshold=5, callback=None):
     # ------------------------
 
     face_detector = FaceDetector.build_model(detector_backend)
@@ -320,7 +325,7 @@ def analysis(db_path, model_name='VGG-Face', detector_backend='opencv', distance
             detected_faces_final = detected_faces.copy()
 
             print("starting thread")
-            t = threading.Thread(target=analyze_image, args=(base_img, input_shape, df, detected_faces_final, enable_face_analysis, model, threshold, emotion_model, age_model, gender_model,))
+            t = threading.Thread(target=analyze_image, args=(base_img, input_shape, df, detected_faces_final, enable_face_analysis, model, threshold, emotion_model, age_model, gender_model, callback))
             t.start()
 
             print("continuing execution")

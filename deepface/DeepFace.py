@@ -763,7 +763,7 @@ def represent(img_path, model_name = 'VGG-Face', model = None, enforce_detection
 
 	return embedding
 
-def stream(db_path = '', model_name ='VGG-Face', detector_backend = 'opencv', distance_metric = 'cosine', enable_face_analysis = True, source = 0, time_threshold = 5, frame_threshold = 5):
+def stream(db_path = '', model_name ='VGG-Face', detector_backend = 'opencv', distance_metric = 'cosine', enable_face_analysis = True, source = 0, time_threshold = 5, frame_threshold = 5, callback = None):
 
 	"""
 	This function applies real time face recognition and facial attribute analysis
