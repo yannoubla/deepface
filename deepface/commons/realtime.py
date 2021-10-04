@@ -138,7 +138,9 @@ def analyze_image(image, input_shape, data_frame, detected_faces_final, enable_f
                     # print(employee_name)
                     display_img = cv2.imread(employee_name)
 
-                    label = employee_name.split("/")[-2]
+                    path = os.path.normpath(employee_name)
+                    label = path.split(os.sep)[-2]
+
                     employee_lock.acquire()
                     employee_name_recon = label
                     employee_lock.release()
