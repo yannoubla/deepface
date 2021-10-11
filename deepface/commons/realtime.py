@@ -18,13 +18,15 @@ from deepface.detectors import FaceDetector
 
 employee_lock = threading.Lock()
 employee_name_recon = None
+is_in_discussion = False
 unknown_employee_name = "UNKNOWN"
+
 
 def analyze_image(image, input_shape, data_frame, detected_faces_final, enable_face_analysis, face_model, face_model_threshold, emotion_model, age_model, gender_model, callback):
     global employee_name_recon
     global unknown_employee_name
+    global is_in_discussion
 
-    time.sleep(1)
     for detected_face in detected_faces_final:
         x = detected_face[0]
         y = detected_face[1]
@@ -39,6 +41,7 @@ def analyze_image(image, input_shape, data_frame, detected_faces_final, enable_f
 
         # -------------------------------
         # facial attribute analysis
+        emotion_label = ""
 
         if enable_face_analysis:
 
@@ -62,7 +65,6 @@ def analyze_image(image, input_shape, data_frame, detected_faces_final, enable_f
 
             # background of mood box
 
-            emotion_label = ""
             highest_emotion_score = 0.0
 
             for index, instance in emotion_df.iterrows():
@@ -136,7 +138,7 @@ def analyze_image(image, input_shape, data_frame, detected_faces_final, enable_f
                 # if True:
                 if best_distance <= face_model_threshold:
                     # print(employee_name)
-                    display_img = cv2.imread(employee_name)
+                    # display_img = cv2.imread(employee_name)
 
                     path = os.path.normpath(employee_name)
                     label = path.split(os.sep)[-2]
@@ -146,13 +148,40 @@ def analyze_image(image, input_shape, data_frame, detected_faces_final, enable_f
                     employee_lock.release()
                     print(f"employee recognized: {label}")
                     # publish something here
+
+                    callback(True, label, emotion_label)
                 else:
                     employee_lock.acquire()
                     employee_name_recon = unknown_employee_name
                     employee_lock.release()
 
+                    callback(False, "unknown", emotion_label)
 
-def analysis(db_path, model_name='VGG-Face', detector_backend='opencv', distance_metric='cosine',
+                print("all done!!!")
+
+    employee_lock.acquire()
+    is_in_discussion = False
+    employee_lock.release()
+
+
+def generate_image_with_avatar(avatar, image):
+    display_img = np.full(image.shape, 255, np.uint8)
+    avatar_x_pos = [0, avatar.shape[1]]
+    avatar_y_offset = int((display_img.shape[0] - avatar.shape[0]) / 2)
+    avatar_y_pos = [avatar_y_offset, avatar_y_offset + avatar.shape[0]]
+    display_img[avatar_y_pos[0]:avatar_y_pos[1], avatar_x_pos[0]:avatar_x_pos[1]] = avatar
+
+    diff_x = display_img.shape[1] - avatar.shape[1]
+    img_x_pos = [avatar.shape[1], display_img.shape[1]]
+    img_y_pos = [0, display_img.shape[0]]
+    img_x_offset = int(avatar.shape[1] / 2)
+    display_img[img_y_pos[0]:img_y_pos[1], img_x_pos[0]:img_x_pos[1]] =\
+        image[0:image.shape[0], img_x_offset:img_x_offset + diff_x]
+
+    return display_img
+
+
+def analysis(db_path, avatar_path, model_name='VGG-Face', detector_backend='opencv', distance_metric='cosine',
              enable_face_analysis=True, source=0, time_threshold=5, frame_threshold=5, callback=None):
     # ------------------------
 
@@ -227,6 +256,7 @@ def analysis(db_path, model_name='VGG-Face', detector_backend='opencv', distance
 
     # TODO: why don't you store those embeddings in a pickle file similar to find function?
 
+    cv2.imread("")
     embeddings = []
     # for employee in employees:
     for index in pbar:
@@ -254,6 +284,13 @@ def analysis(db_path, model_name='VGG-Face', detector_backend='opencv', distance
 
     pivot_img_size = 112  # face recognition result image
 
+    # load avatars
+    avatars = {}
+    for file in os.listdir(avatar_path):
+        full_path = os.path.join(avatar_path, file)
+        if os.path.isfile(full_path):
+            avatars[os.path.splitext(file)[0]] = cv2.imread(full_path)
+
     # -----------------------
 
     freeze = False
@@ -263,6 +300,7 @@ def analysis(db_path, model_name='VGG-Face', detector_backend='opencv', distance
     tic = time.time()
 
     cap = cv2.VideoCapture(source)  # webcam
+
 
     while (True):
         ret, img = cap.read()
@@ -320,67 +358,34 @@ def analysis(db_path, model_name='VGG-Face', detector_backend='opencv', distance
                 face_index = face_index + 1
 
             # -------------------------------------
-
-        if face_detected and face_included_frames >= frame_threshold and not freeze:
-            freeze = True
+        global is_in_discussion
+        if face_detected and face_included_frames >= frame_threshold and not is_in_discussion:
+            employee_lock.acquire()
+            is_in_discussion = True
+            employee_lock.release()
             base_img = raw_img.copy()
             detected_faces_final = detected_faces.copy()
 
             print("starting thread")
-            t = threading.Thread(target=analyze_image, args=(base_img, input_shape, df, detected_faces_final, enable_face_analysis, model, threshold, emotion_model, age_model, gender_model, callback))
+            t = threading.Thread(target=analyze_image, args=(base_img, input_shape, df, detected_faces_final, enable_face_analysis, model, threshold, emotion_model, age_model, gender_model, callback, avatars))
             t.start()
 
-            print("continuing execution")
-            tic = time.time()
+        if not is_in_discussion and not faces:
+            # cv2.putText(img, "Place your face inside the circle", (150, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.50,
+            #             (50, 50, 50), 2)
 
-        if freeze:
-
-            toc = time.time()
-            if (toc - tic) < time_threshold:
-
-                time_left = int(time_threshold - (toc - tic) + 1)
-
-                #cv2.rectangle(freeze_img, (10, 10), (90, 50), (67, 67, 67), -10)
-                #cv2.putText(freeze_img, str(time_left), (40, 40), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 1)
-                display_name = None
-                employee_lock.acquire()
-                display_name = employee_name_recon
-                employee_lock.release()
-
-                if display_name and display_name != unknown_employee_name:
-                    message = f"Welcome {display_name}"
-                    cv2.putText(img, message, (40, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.75,
-                                (50, 50, 50), 2)
-                    cv2.ellipse(img=img, center=ellipse_center,
-                                axes=(ellipse_x, ellipse_y), angle=0, startAngle=0, endAngle=360,
-                                color=(0, 128, 0), thickness=2)
-                elif display_name and display_name == unknown_employee_name:
-                    cv2.putText(img, "Intruder!!", (40, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.75,
-                                (0, 9, 200), 2)
-                    cv2.ellipse(img=img, center=ellipse_center,
-                                axes=(ellipse_x, ellipse_y), angle=0, startAngle=0, endAngle=360,
-                                color=(0, 0, 200), thickness=2)
-                else:
-                    cv2.ellipse(img=img, center=ellipse_center,
-                                axes=(ellipse_x, ellipse_y), angle=0, startAngle=0, endAngle=360,
-                                color=(0, 128, 0), thickness=2)
-
-
-                freezed_frame = freezed_frame + 1
-            else:
-                face_detected = False
-                face_included_frames = 0
-                freeze = False
-                freezed_frame = 0
-
-        else:
-            cv2.putText(img, "Place your face inside the circle", (40, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.75,
-                        (50, 50, 50), 2)
+            display_img = generate_image_with_avatar(avatars["up"], img)
+        elif not is_in_discussion and faces:
             cv2.ellipse(img=img, center=ellipse_center,
                         axes=(ellipse_x, ellipse_y), angle=0, startAngle=0, endAngle=360,
                         color=(128, 128, 128), thickness=2)
 
-        cv2.imshow('img', img)
+            display_img = generate_image_with_avatar(avatars["down"], img)
+        else:
+
+            display_img = generate_image_with_avatar(avatars["welcome"], img)
+
+        cv2.imshow('img', display_img)
 
         if cv2.waitKey(1) & 0xFF == ord('q'):  # press q to quit
             break
